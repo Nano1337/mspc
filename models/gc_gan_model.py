@@ -45,10 +45,11 @@ class GcGANModel(BaseModel):
         parser.add_argument('--lambda_AB', type=float, default=10.0, help='weight for gc loss')
         parser.add_argument('--lambda_gc', type=float, default=2.0, help='trade-off parameter for Gc and idt')
         parser.add_argument('--lambda_G', type=float, default=1.0, help='trade-off parameter for G, gc, and idt')
-        parser.add_argument('--geometry', type=str, default='rot',
-                            help='type of consitency.')
         parser.add_argument('--idt', type=util.str2bool, nargs='?', const=True, default=True,
                             help='use NCE loss for identity mapping: NCE(G(Y), Y))')
+
+        # options for RSP
+        parser.add_argument('--rsp', action='store_true', help='use random spatial perturbation')
 
         return parser
 
@@ -67,6 +68,7 @@ class GcGANModel(BaseModel):
             # self.netD_gc_B = DDP(self.netD_gc_B, broadcast_buffers=False)
         self.loss_names = ['D_B', 'G_AB', 'G_gc_AB']
         self.visual_names = ['real_A', 'fake_B', 'fake_gc_B', 'real_B']
+        self.transform_mode = "rot"
 
         if opt.idt and self.isTrain:
             self.loss_names += ['idt', 'idt_gc', 'gc']
@@ -147,6 +149,19 @@ class GcGANModel(BaseModel):
             tensor = torch.index_select(tensor, 2, inv_idx)
         return tensor
 
+    def apply_rsp(self, img, perturbation):
+        if perturbation == "rot": 
+            return self.rot90(img, 0)
+
+        elif perturbation == "vf": 
+            inv_idx = torch.arange(self.opt.crop_size - 1, -1, -1).long().cuda()
+            return torch.index_select(img, 2, inv_idx)
+
+        # TODO: add the rest of the transformation functions here
+
+        else:
+            raise ValueError("Geometry transformation function [%s] not recognized." % self.transform_mode)
+
     def forward(self):
         input_A = self.input_A.clone()
         input_B = self.input_B.clone()
@@ -154,17 +169,10 @@ class GcGANModel(BaseModel):
         self.real_A = self.input_A
         self.real_B = self.input_B
 
-        size = self.opt.crop_size
+        self.transform_mode = random.choice(['rot', 'vf'])
 
-        if self.opt.geometry == 'rot':
-            self.real_gc_A = self.rot90(input_A, 0)
-            self.real_gc_B = self.rot90(input_B, 0)
-        elif self.opt.geometry == 'vf':
-            inv_idx = torch.arange(size - 1, -1, -1).long().cuda()
-            self.real_gc_A = torch.index_select(input_A, 2, inv_idx)
-            self.real_gc_B = torch.index_select(input_B, 2, inv_idx)
-        else:
-            raise ValueError("Geometry transformation function [%s] not recognized." % self.opt.geometry)
+        self.real_gc_A = self.apply_rsp(input_A, self.transform_mode)
+        self.real_gc_B = self.apply_rsp(input_B, self.transform_mode)
 
     def get_gc_rot_loss(self, AB, AB_gc, direction):
         loss_gc = 0.0
@@ -223,20 +231,22 @@ class GcGANModel(BaseModel):
         fake_gc_B = self.fake_gc_B_pool.query(self.fake_gc_B)
         loss_D_B = self.backward_D_basic(self.netD_B, self.real_B, fake_B, self.netD_gc_B, self.real_gc_B, fake_gc_B)
         self.loss_D_B = loss_D_B.item()
-
+        
+    # TODO modify to incorporate new augmentations
     def backward_G(self):
-        # adversariasl loss
+        # adversarial loss
         fake_B = self.netG_AB.forward(self.real_A)
         pred_fake = self.netD_B.forward(fake_B)
         loss_G_AB = self.criterionGAN(pred_fake, True) * self.opt.lambda_G
 
+        # perturbed adversarial loss
         fake_gc_B = self.netG_AB.forward(self.real_gc_A)
         pred_fake = self.netD_gc_B.forward(fake_gc_B)
         loss_G_gc_AB = self.criterionGAN(pred_fake, True) * self.opt.lambda_G
 
-        if self.opt.geometry == 'rot':
+        if self.transform_mode == 'rot':
             loss_gc = self.get_gc_rot_loss(fake_B, fake_gc_B, 0)
-        elif self.opt.geometry == 'vf':
+        elif self.transform_mode == 'vf':
             loss_gc = self.get_gc_vf_loss(fake_B, fake_gc_B)
 
         if self.opt.identity > 0:
@@ -287,17 +297,8 @@ class GcGANModel(BaseModel):
         input_A = self.input_A.clone()
         input_B = self.input_B.clone()
 
-        size = self.opt.crop_size
-
-        if self.opt.geometry == 'rot':
-            self.real_gc_A = self.rot90(input_A, 0)
-            self.real_gc_B = self.rot90(input_B, 0)
-        elif self.opt.geometry == 'vf':
-            inv_idx = torch.arange(size - 1, -1, -1).long().cuda()
-            self.real_gc_A = Variable(torch.index_select(input_A, 2, inv_idx))
-            self.real_gc_B = Variable(torch.index_select(input_B, 2, inv_idx))
-        else:
-            raise ValueError("Geometry transformation function [%s] not recognized." % self.opt.geometry)
+        self.real_gc_A = self.apply_rsp(input_A, self.transform_mode)
+        self.real_gc_B = self.apply_rsp(input_B, self.transform_mode)
 
         self.fake_B = self.netG_AB.forward(self.real_A).data
         self.fake_gc_B = self.netG_AB.forward(self.real_gc_A).data
